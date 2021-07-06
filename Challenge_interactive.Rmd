@@ -1,0 +1,430 @@
+---
+title: "Informal ML community's 2021 Summer Challenge"
+subtitle: "Baseline model & walkthrough - Interactive version for competitors"
+output:
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_depth: 2
+    df_print: paged
+    code_folding: hide
+    number_sections: TRUE
+runtime: shiny
+editor_options:
+  chunk_output_type: inline
+---
+
+# Introduction
+
+This code demonstrates the preparation of the dataset and its use to train the baseline specification of the three ML models used in the Informal ML Community's Summer Challenge. Remember, the task is to play around with the parameters and model weights in the ensemble to try and improve on the baseline performance.
+
+Please keep in mind those are very simple models, with a simplified code that abstracts from some complexities of ML applications that are put into production. They were chosen to illustrate some commonly used ML techniques, and what sort of decisions ML practitioners need to make as they train and deploy their models. This is especially true for the neural network (3rd model below), which are significantly more customised in real-life and even in competition models. However, this simple implementation should already help with our goal, which is to build intuition.
+
+```{r load packages, include=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(DT)
+library(keras)
+library(ranger)
+library(xgboost)
+```
+
+# Data
+
+
+The dataset used in this challenge is a simplified version of a more complete Olympics dataset. The original source for this data is found [here](https://www.kaggle.com/heesoo37/120-years-of-olympic-history-athletes-and-results) (obs.: a free Kaggle subscription is needed to access this page). 
+
+## Target
+
+The goal of this challenge is to forecast the target variable: the number of medals (gold, silver or bronze) earned by athletes of a delegation in a given Summer Olympics, divided by the total number of athteles in that delegation. The number of medals is calculated as the number of athletes that earned medals, not by the number of sport events from which they earned medals. For example, each of the athletes of the female football team earning a medal are counted in the numerator, instead of just one medal for the whole team.
+
+## Predictors
+
+In this challenge, you will be using variables at the level of delegation/year (ie, related to a single national delegation in a given Olympic year) to try and predict the target variable. The predictors used are:
+
+* `NumAthletes`: the number of athletes of the delegation during that year
+* `PctFemale`: the percentage of the athletes that are women
+* `AvgAge`: the average age of athletes
+* `AvgHeight`: their average height
+* `AvgWeight`: their average height
+* `AvgOlympicExp`: the average olympic experience of the delegation, measured in number of Olympic Games attended by athletes. Eg, for a delegation with 3 athletes, where 2 are first-timers (experience = 1) and for the third one this is the fifth Olympic Games (experience = 5), this value will be: (1 + 1 + 5) / 3 = 2.333333 Games.
+* `PctAchievPrevGames`: percentge of athletes in a delegation that earned a medal in the Olympic Games immediately preceding the current one.
+* `PctPastMedals`: percentage of athletes in a delegation that has earned medals at any previous Olympic Games. (Note that PctPastMedals $\geq$ PctAchievPrevGames.)
+
+Here's the full dataset used in the competition - you can download it if you wish. It's got much less rows than the original dataset mentioned above because that one was at the athlete/year-level, while this one is at the delegation-year level.
+
+```{r dataset used in competition, message=FALSE, warning=FALSE}
+ds <- read_csv("olympics_challenge_dataset.csv")
+
+ds %>% 
+  datatable(extensions = 'Buttons',
+            caption = "Dataset used in the competition (without the 2016 data).",
+            filter = "top",
+            options = list(
+              dom = 'Blfrtip',
+              buttons = c("csv", "excel"),
+              pageLength = 5
+            ))
+```
+
+## Training and testing sets
+
+The competition data (ie, up to the 2012 Games) is split into a training and testing set.
+
+The *training dataset* is the one used to train the ML models. But because ML models are very good at identying patterns in the data, if we evaluated our models with the same data used for training, there is a good chance we would be fooled by a good in-sample performance when the ML model might perform poorly with out-of-sample data. Thus, a sound practice is to separate a part of the dataset that is not used to train the models, but only to evaluate them, this is called *validation dataset* or *testing dataset*. 
+
+Since competitors do not have access to the 2016 Games data (which will be used to define the winner), the code below randomly selects a testing dataset from the data from 2008 and 2012, since they are the closest to our true prediction goal (the 2016 Olympics). All model performance reported below to competitors when they are shifting the parameters will be calculated on this testing dataset. The remaining data are available to train the models.
+
+Note also that the code has an interesting command: `set.seed(42)`. What this does is to tell R to use random numbers that are reproducible. This is just to ensure we always get the same random numbers every time we run the code - otherwise every split would be slightly different. Each random "seed" is an integer - think of them as one of many random paths. You might come across people using the seed "42" quite frequently in their codes. If you don't know why, [here's the reason (YouTube link)](https://www.youtube.com/watch?v=aboZctrHfK8).
+
+```{r split th dataset}
+set.seed(42)
+
+nrows_latest_two_years <- ds %>% 
+  filter(Year %in% c(2008, 2012)) %>% 
+  nrow()
+
+test_idx <- sample(nrows_latest_two_years, floor(nrows_latest_two_years * 0.35))
+
+test_ds <- ds %>% 
+  filter(Year %in% c(2008, 2012)) %>% 
+  dplyr::slice(test_idx)
+
+train_ds <- ds %>% 
+  anti_join(test_ds)
+```
+
+# Pre-processing
+
+Since the prize is gastronomical, this competition also needed to involve recipes. Hum... actually, `recipes` is a very handy R package, part of `tidymodels`, that enables you to save steps in data pre-processing and reapply those steps again and again to other datasets, minimising operational errors such as forgetting to do one of the steps. It is also very useful because **in ML, preprocessing steps that depend on some information from the whole dataset (such as normalising the sample by subtracting the dataset-level mean and dividing by the dataset-level standard deviation) should only reflect the training dataset**, otherwise the ML model will sniff out this leaked information from the evaluation dataset and will fool you into thinking they have a good performance when in fact the evaluation data was not completely "out of sample".
+
+Here we set the recipe of pre-processing steps that will be applicable to the data before it is passed to the ML models.
+
+This is a simple model, so we are setting the following steps:
+1. we specify that model is about predicting "Target" using all of the listed predictors that we already discussed above.
+2. some data are missing (like, average age for some smallerdelegations in some Olympic Games) - we could either exclude those observations with missing data, or *impute* numbers to them. Here we tell R to impute any missing data found in predictor variables using the sample median.
+3. now that the dataset is complete, we tell R to normalise the data. ML models often work better (or even "require") datasets to be normalised for results to converge.
+
+```{r set recipe}
+rec <- recipe(Target ~ NumAthletes + PctFemale + AvgAge + AvgHeight + AvgWeight + AvgOlympicExp + PctAchievPrevGames + PctPastMedals, data = train_ds) %>%
+  step_impute_median(all_predictors()) %>% 
+  step_normalize(all_predictors()) 
+```
+
+
+In the `tidymodels` universe, a "workflow" is a collection of steps including pre-processing and model training. Just as a "recipe" described above can keep your mental sanity by avoiding repetition and operational mistakes, workflows do the same for a combined recipe + model estimation.
+
+Because we are using the same preprocessing steps with three different models, we're setting up here a basic worflow containing only the "recipe" and later we add that to each model.
+
+```{r basic workflow}
+basic_wf <- workflow() %>% 
+  add_recipe(rec)
+```
+
+# ML models {.tabset .tabset-fade .tabset-pills}
+
+Now we will run the baseline ML models. The first one will be a random forest. Then we'll move to a gradient boosted tree. Finally, we'll create a neural network.
+
+We'll use `tidymodels` to create the models and then combine these models with that basic workflow we created above. The training data we separated above will be used to train these models using the model-specific workflows.
+
+Notice that we clip the predictions to be between 0 and 1, just in case any model's output was outside of this range.
+
+Before going into the specific models, just a small word on the concept of *overfit*: ML models tend to be too good for their own sake at uncovering the data's pattern. So much so that they may learn the training data so well, that they fail to learn only the patterns that occur more generally also in new data. This should be avoided, to ensure a model's good performance. Generally, the more "powerful" a model is, the higher the chance for overfitting - so keep that in mind during the competition.
+
+You are now invited to go over each of the three models in the tabs below, pick the parameters and click on the button to train the models.
+
+## Random forest
+
+Parameter: `min_years`
+If you only use recent Olympics, the data may be more informative - but then, you get less data to train your model. In case competitors want to use only more recent Olympics, they can filter for Games years to only those greater than or equal to 1988, 1992, etc by setting the `min_year` parameter. Please note that only `min_year` between 1984 and 2012 will be accepted. Also, note that this parameter can be set differently for each of the three models. 
+```{r input rf_param_min_year}
+sliderInput("rf_param_min_year", "First Olympic Games in the sample (the last one will be 2012) for the random forest:",
+                        min = 1984, max = 2012, step = 4, value = 1984, sep = "", ticks = FALSE)
+```
+
+
+Parameter: `trees`
+More trees tend to improve model performance, but may also make it more likely to overfit.
+```{r input rf_param_trees}
+sliderInput("rf_param_trees", "Number of trees contained in the random forest ensemble:",
+                        min = 2, max = 300, value = 15)
+```
+
+
+Parameter: `min_n`
+The minimum number of data points in a node that is required for the node to be split further. Higher numbers tend to be more conservative, lowering chances of overfitting.
+
+```{r input rf_param_min_n}
+sliderInput("rf_param_min_n", "Minumum number of data points in a new node:",
+                        min = 1, max = 100, value = 3)
+```
+
+
+After you chose the parameters above, click on the button below to train the model.
+
+```{r train button rf}
+actionButton("train_rf", "Click to train the random forest with the parameters you chose")
+```
+
+
+```{r random forest}
+rf <- reactiveValues(params = NULL, model = NULL, wf = NULL, predict = NULL, rmse = NULL)
+
+reactive({
+  rf$model <- 
+    rand_forest(trees = input$rf_param_trees, min_n = input$rf_param_min_n) %>% 
+    set_mode("regression") %>%
+    set_engine("ranger")
+  })
+
+observeEvent(input$train_rf, {
+  rf$params$min_year = input$rf_param_min_year
+  rf$params$trees = input$rf_param_trees
+  rf$params$min_n = input$rf_param_min_n
+  
+  training_ds <- train_ds %>% 
+    filter(Year >= rf$params$min_year)
+
+  set.seed(42)
+  rf$wf <- 
+    basic_wf %>% 
+    add_model(rf$model) %>%
+    fit(data = training_ds)
+  rf$predict <- 
+    rf$wf %>% 
+    predict(new_data = test_ds)
+  rf$predict$.pred %>% 
+    pmax(0) %>%
+    pmin(1)
+  rf$rmse <- rmse_vec(test_ds$Target, rf$predict$.pred)
+})
+```
+
+**Once the model is trained, the results will apear below:**
+
+The rmse for the random forest with `min_year` set to `r renderText(rf$params$min_year)`, `trees` set to `r renderText(rf$params$trees)` and `min_n` set to `r renderText(rf$params$min_n)` is  **`r renderText(rf$rmse)`**. Lower values are better.
+
+## Gradient boosted trees
+
+Parameter: `min_years`
+If you only use recent Olympics, the data may be more informative - but then, you get less data to train your model. In case competitors want to use only more recent Olympics, they can filter for Games years to only those greater than or equal to 1988, 1992, etc by setting the `min_year` parameter. Please note that only `min_year` between 1984 and 2012 will be accepted. Also, note that this parameter can be set differently for each of the three models. 
+
+```{r input gbt_param_min_year}
+sliderInput("gbt_param_min_year", "First Olympic Games in the sample (the last one will be 2012) for the boosted trees:",
+                        min = 1984, max = 2012, step = 4, value = 1984, sep = "", ticks = FALSE)
+```
+
+
+Parameter: `trees`
+More trees tend to improve model performance, but may also make it more likely to overfit.
+```{r input gbt_param_trees}
+sliderInput("gbt_param_trees", "Number of trees contained in the random forest ensemble:",
+                        min = 2, max = 300, value = 15)
+```
+
+
+Parameter: `min_n`
+The minimum number of data points in a node that is required for the node to be split further. Higher numbers tend to be more conservative, lowering chances of overfitting.
+
+```{r input gbt_param_min_n}
+sliderInput("gbt_param_min_n", "Minumum number of data points in a new node:",
+                        min = 1, max = 100, value = 3)
+```
+
+Parameter: `learn_rate`
+
+The rate at which the boosting algorithm adapts from iteration-to-iteration. Lower values are more conservative, lowering chances of overfitting.
+
+
+```{r input gbt_param_learn_rate}
+sliderInput("gbt_param_learn_rate", "Learning rate:",
+                        min = 0, max = 1, value = 0.3)
+```
+
+After you chose the parameters above, click on the button below to train the model.
+
+```{r train button gbt}
+actionButton("train_gbt", "Click to train the gradient boosted trees with the parameters you chose")
+```
+
+
+```{r gradient boosted trees}
+gbt <- reactiveValues(params = NULL, model = NULL, wf = NULL, predict = NULL, rmse = NULL)
+
+reactive({
+  gbt$model <- 
+    boost_tree(trees = input$gbt_param_trees, 
+               min_n = input$gbt_param_min_n, 
+               learn_rate = input$gbt_param_learn_rate) %>% 
+    set_mode("regression") %>%
+    set_engine("xgboost")
+  })
+
+observeEvent(input$train_gbt, {
+  gbt$params$min_year = input$gbt_param_min_year
+  gbt$params$trees = input$gbt_param_trees
+  gbt$params$min_n = input$gbt_param_min_n
+  gbt$params$learn_rate = input$gbt_param_learn_rate
+  
+  training_ds <- train_ds %>% 
+    filter(Year >= gbt$params$min_year)
+
+  set.seed(42)
+  gbt$wf <- 
+    basic_wf %>% 
+    add_model(gbt$model) %>%
+    fit(data = training_ds)
+  gbt$predict <- 
+    gbt$wf %>% 
+    predict(new_data = test_ds)
+  gbt$predict$.pred %>% 
+    pmax(0) %>%
+    pmin(1)
+  gbt$rmse <- rmse_vec(test_ds$Target, gbt$predict$.pred)
+})
+```
+
+**Once the model is trained, the results will apear below:**
+
+The rmse for the gradient boosted trees model with `min_year` set to `r renderText(gbt$params$min_year)`, `trees` set to `r renderText(gbt$params$trees)`, `min_n` set to `r renderText(gbt$params$min_n)` and `learn_rate` set to `r renderText(gbt$params$learn_rate)` is  **`r renderText(gbt$rmse)`**. Lower values are better.
+
+## Neural network
+
+Parameter: `min_years`
+If you only use recent Olympics, the data may be more informative - but then, you get less data to train your model. In case competitors want to use only more recent Olympics, they can filter for Games years to only those greater than or equal to 1988, 1992, etc by setting the `min_year` parameter. Please note that only `min_year` between 1984 and 2012 will be accepted. Also, note that this parameter can be set differently for each of the three models. 
+```{r input nn_param_min_year}
+sliderInput("nn_param_min_year", "First Olympic Games in the sample (the last one will be 2012) for the neural network:",
+                        min = 1984, max = 2012, step = 4, value = 1984, sep = "", ticks = FALSE)
+```
+
+
+Parameter: `hidden_units`
+
+"Hidden units" is a very convoluted term for the size of the parameter vector. More hidden units translate to a bigger number of parameters, which makes the model more powerful but at the same time, more prone to overfitting.
+
+```{r input nn_param_hidden_units}
+sliderInput("nn_param_hidden_units", "Number of hidden units in the neural network layer:",
+                        min = 10, max = 250, value = 64)
+```
+
+Parameter: `epochs`
+
+Number of times that the neural network iterates through the training dataset to update its parameters. Larger neural networks (eg, models with more hidden units) require more epochs to achieve good results. But, as the number of epoch increases, the model may start overfitting very quickly.
+
+```{r input nn_param_epochs}
+sliderInput("nn_param_epochs", "Number of epochs to train the neural network layer:",
+                        min = 3, max = 50, value = 10)
+```
+
+After you chose the parameters above, click on the button below to train the model.
+
+```{r train button nn}
+actionButton("train_nn", "Click to train the neural network with the parameters you chose (may take a few seconds to train)")
+```
+
+
+```{r neural network}
+nn <- reactiveValues(params = NULL, model = NULL, wf = NULL, predict = NULL, rmse = NULL)
+
+reactive({
+  nn$model <- 
+    mlp(hidden_units = input$nn_param_hidden_units, epochs = input$nn_param_epochs, activation = "relu") %>% 
+    set_mode("regression") %>%
+    set_engine("keras")
+  })
+
+observeEvent(input$train_nn, {
+  nn$params$min_year = input$nn_param_min_year
+  nn$params$hidden_units = input$nn_hidden_units
+  nn$params$epochs = input$nn_param_epochs
+  
+  training_ds <- train_ds %>% 
+    filter(Year >= nn$params$min_year)
+  
+  set.seed(42)
+  nn$wf <- 
+    basic_wf %>% 
+    add_model(nn$model) %>%
+    fit(data = training_ds)
+  nn$predict <- 
+    nn$wf %>% 
+    predict(new_data = test_ds)
+  nn$predict$.pred %>% 
+    pmax(0) %>%
+    pmin(1)
+  nn$rmse <- rmse_vec(test_ds$Target, nn$predict$.pred)
+})
+```
+
+**Once the model is trained, the results will apear below:**
+
+The rmse for the neural network with `min_year` set to `r renderText(nn$params$min_year)`, `hidden_units` set to `r renderText(nn$params$hidden_units)` and `epochs` set to `r renderText(nn$params$epochs)` is  **`r renderText(nn$rmse)`**. Lower values are better.
+
+# Ensemble
+
+One you have trained the three models above and selected their relative contributions to the ensemble, please click the button below to open up a comparison of the individual forecasts for each one and the true value of the testing dataset. 
+
+Choose the relative weights between the three models in the 
+
+```{r input slider_weights}
+sliderInput("ensemble_weights", "Random forest | Boosted trees | Neural net",
+                        min = 0, max = 1, value = c(0.33, 0.66))
+
+ensemble_weights <- reactiveValues(rf = 1/3, gbr = 1/3, nn = 1/3)
+
+reactive({
+  ensemble_weights$rf = input$ensemble_weights[1] %>% max(0)
+  ensemble_weights$gbt = input$ensemble_weights[2] - input$ensemble_weights[1] %>% max(0)
+  ensemble_weights$nn = 1 - input$ensemble_weights[2] %>% max(0)
+})
+
+ensemble_prediction <- reactiveValues(.pred = NULL, rmse = NULL)
+
+reactive({
+  ensemble_prediction$.pred = 
+    ensemble_weights$rf * rf$predict$.pred +
+    ensemble_weights$gbt * gbt$predict$.pred +
+    ensemble_weights$nn * nn$predict$.pred
+  
+  ensemble_prediction$rmse = rmse_vec(test_ds$Target, ensemble_prediction$.pred)
+})
+```
+
+Contribution of each model to the final prediction:
+
+* Random forest: `r renderText(100 * ensemble_weights$rf)`% (RMSE: `r renderText(rf$rmse)`)
+
+* Gradient boosted trees: `r renderText(100 * ensemble_weights$gbt)`% (RMSE: `r renderText(gbt$rmse)`)
+
+* Neural network: `r renderText(100 * ensemble_weights$nn)`% (RMSE: `r renderText(nn$rmse)`)
+
+**Testing set RMSE: `r renderText(ensemble_prediction$rmse %>% round(4))`**
+
+As a reminder, the value above is calculated on the testing dataset (random sample of 2008 and 2012 Olympics delegations), because these Games are the closest in the sample to the 2016 Olympics, which will be the yardstick in this competition.
+
+# Final word
+
+Best of luck in the competition!
+Please send your (up to three) submissions to me via e-mail. You can just write something like:
+
+> Name: ...<br>
+> Submission #1 (or 2, or 3)<br>
+> rf_min_year: X<br>
+> rf_trees: X<br>
+> rf_min_n: X<br>
+> gbt_min_year: X<br>
+> gbt_trees: X<br>
+> gbt_min_n: X<br>
+> gbt_learn_rate: X<br>
+> nn_min_year: X<br>
+> nn_hidden_units: X<br>
+> nn_epochs: X<br>
+> rf_weight: X<br>
+> gbt_weight: X<br>
+> nn_weight: X<br>
+> testing set RMSE: 0.yyyyyyyy
+
+I hope you like this competition and get something useful out of it. I'd be grateful if you could be prepared to share your experience picking the parameters with Community participants!
+
+Best regards,<br>
+Doug
