@@ -37,3 +37,11 @@ vignettes/*.pdf
 
 # R Environment Variables
 .Renviron
+
+# Some local folders and files used during dev that should not be uploaded
+data/
+Informal_ML_challenge/
+rsconnect/
+.Rhistory
+
+
