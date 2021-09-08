@@ -1,0 +1,188 @@
+---
+title: "Informal ML community's 2021 Summer Challenge Results"
+subtitle: "Leaderboard"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r load packages, include=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(DT)
+library(keras)
+library(ranger)
+library(xgboost)
+```
+
+```{r include=FALSE}
+private_leaderboard = TRUE
+if (private_leaderboard) {
+  train_ds <- read_csv("olympics_challenge_dataset.csv")
+  test_ds <- read_csv("olympics_challenge_lb_dataset.csv")
+} else {
+  set.seed(42)
+
+  ds <- read_csv("olympics_challenge_dataset.csv")
+  
+  nrows_latest_two_years <- ds %>% 
+    filter(Year %in% c(2008, 2012)) %>% 
+    nrow()
+  
+  test_idx <- sample(nrows_latest_two_years, floor(nrows_latest_two_years * 0.35))
+  
+  test_ds <- ds %>% 
+    filter(Year %in% c(2008, 2012)) %>% 
+    dplyr::slice(test_idx)
+  
+  train_ds <- ds %>% 
+    anti_join(test_ds)
+}
+
+```
+
+```{r set recipe}
+rec <- recipe(Target ~ NumAthletes + PctFemale + AvgAge + AvgHeight + AvgWeight + AvgOlympicExp + PctAchievPrevGames + PctPastMedals, data = train_ds) %>%
+  step_impute_median(all_predictors()) %>% 
+  step_normalize(all_predictors()) 
+```
+
+```{r basic workflow}
+basic_wf <- workflow() %>% 
+  add_recipe(rec)
+```
+
+Below I include simulated submissions. If you want to check your results, include them here.
+
+```{r organise submissions}
+submissions <- tribble(
+  ~Name, ~rf_min_year, ~rf_trees, ~rf_min_n, ~gbt_min_year, ~gbt_trees, ~gbt_min_n, ~gbt_learn_rate, ~nn_min_year, ~nn_hidden_units, ~nn_epochs, ~rf_weight, ~gbt_weight, ~nn_weight,
+  "Submission_1", 1992, 122, 30, 1992, 122, 30, 0.1, 1992, 115, 33, 0.33, 0.33, 0.34,
+  "Submission_2", 1996, 108, 8, 1984, 61, 35, 0.1, 1996, 222, 41, 0.44, 0.42, 0.14
+)
+```
+
+```{r function to train models with submitted params}
+train_models <- function(submission, train_ds, test_ds) {
+  set.seed(42)
+  # random forest
+  rf <- list()
+  
+  rf$training_ds <- train_ds %>% 
+    filter(Year >= submission$rf_min_year)
+  
+  rf$model <- 
+    rand_forest(
+      trees = submission$rf_trees, 
+      min_n = submission$rf_min_n) %>% 
+    set_mode("regression") %>%
+    set_engine("ranger")
+  
+  rf$wf <- 
+    basic_wf %>% 
+    add_model(rf$model) %>%
+    fit(data = rf$training_ds)
+  
+  rf$predict <- 
+    rf$wf %>% 
+    predict(new_data = test_ds)
+  
+  rf$predict$.pred %>% 
+    pmax(0) %>%
+    pmin(1)
+  
+  rf$rmse <- rmse_vec(test_ds$Target, rf$predict$.pred)
+  
+  # gradient-boosting trees
+  gbt <- list()
+  
+  gbt$training_ds <- train_ds %>% 
+    filter(Year >= submission$gbt_min_year)
+  
+  gbt$model <- 
+    boost_tree(
+      trees = submission$gbt_trees, 
+      min_n = submission$gbt_min_n, 
+      learn_rate = submission$gbt_learn_rate) %>% 
+    set_mode("regression") %>%
+    set_engine("xgboost")
+  
+  gbt$wf <- 
+    basic_wf %>% 
+    add_model(gbt$model) %>%
+    fit(data = gbt$training_ds)
+  
+  gbt$predict <- 
+    gbt$wf %>% 
+    predict(new_data = test_ds)
+  
+  gbt$predict$.pred %>% 
+    pmax(0) %>%
+    pmin(1)
+  
+  gbt$rmse <- rmse_vec(test_ds$Target, gbt$predict$.pred)
+  
+  # neural network
+
+  nn <- list()
+  keras::k_clear_session()
+  tensorflow::tf$random$set_seed(42)
+  set.seed(42)
+   
+  nn$training_ds <- train_ds %>% 
+    filter(Year >= submission$nn_min_year)
+  
+  nn$model <- 
+    mlp(
+      hidden_units = submission$nn_hidden_units,
+      epochs = submission$nn_epochs, 
+      activation = "relu") %>% 
+    set_mode("regression") %>%
+    set_engine("keras")
+  
+  nn$wf <- 
+    basic_wf %>% 
+    add_model(nn$model) %>%
+    fit(data = nn$training_ds)
+  
+  nn$predict <- 
+    nn$wf %>% 
+    predict(new_data = test_ds)
+  
+  nn$predict$.pred %>% 
+    pmax(0) %>%
+    pmin(1)
+  
+  nn$rmse <- rmse_vec(test_ds$Target, nn$predict$.pred)
+  
+  # ensemble
+  ensemble <- list()
+  
+  ensemble$predict <- 
+    submission$rf_weight * rf$predict$.pred +
+    submission$gbt_weight * gbt$predict$.pred +
+    submission$nn_weight * nn$predict$.pred
+  
+  ensemble$rmse <- rmse_vec(test_ds$Target, ensemble$predict)
+    
+  # return
+  return(list(
+    rf = rf$rmse,
+    gbt = gbt$rmse,
+    nn = nn$rmse,
+    ensemble = ensemble$rmse
+  ))
+}
+```
+
+```{r run submissions, message=FALSE, warning=FALSE, include=FALSE}
+subm_results <- list()
+for (i in 1:nrow(submissions)) {
+  subm_name <- submissions[i, 1] %>% as.character()
+  subm_results[[subm_name]] <- train_models(submissions[i, -1],  train_ds, test_ds)
+}
+```
+
+```{r}
+subm_results
+```
